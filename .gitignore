@@ -1,0 +1,30 @@
+# ---- ESP-IDF build artifacts ----
+bno055_imu_show/build/
+bno055_imu_show/sdkconfig
+bno055_imu_show/sdkconfig.old
+bno055_imu_show/managed_components/
+bno055_imu_show/dependencies.lock
+*.bin
+*.elf
+*.map
+
+# sdkconfig.defaults IS tracked (it carries the LF / log settings); only the
+# generated sdkconfig is ignored above.
+
+# ---- Python ----
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Diagnostic scripts not part of the deliverable ----
+bridge.py
+validate.py
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
