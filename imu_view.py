@@ -165,6 +165,18 @@ def apply(M, v):
     return [sum(M[i][k] * v[k] for k in range(3)) for i in range(3)]
 
 
+def matmul(A, B):
+    return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def transpose(M):
+    # For a rotation matrix, the transpose is its inverse.
+    return [[M[j][i] for j in range(3)] for i in range(3)]
+
+
+IDENTITY = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+
+
 def project(v, scale, cx, cy):
     # Simple isometric-ish projection: rotate the world a bit so we see depth,
     # then orthographic. View transform: tilt down and rotate.
@@ -228,6 +240,13 @@ def main():
 
     # Body axes extend a bit beyond the board so they're visible.
     axis_len = 140
+    # World axes drawn fixed in space. Slightly longer so they read as the frame.
+    world_axis_len = 170
+
+    # Calibration: offset matrix applied as offset * current. Pressing C sets
+    # offset = inverse(current), which zeroes the displayed orientation so the
+    # device frame coincides with the world frame at that instant.
+    offset = [row[:] for row in IDENTITY]
 
     running = True
     while running:
@@ -244,6 +263,12 @@ def main():
                 # e.y > 0 scroll up = zoom in
                 factor = 1.15 ** e.y
                 scale = max(SCALE_MIN, min(SCALE_MAX, scale * factor))
+            elif e.type == pygame.KEYDOWN and e.key == pygame.K_c:
+                # Calibrate: make the current device orientation the new zero.
+                offset = transpose(euler_to_matrix(pitch, roll, yaw))
+            elif e.type == pygame.KEYDOWN and e.key == pygame.K_r:
+                # Reset calibration back to raw orientation.
+                offset = [row[:] for row in IDENTITY]
 
         (pitch, roll, yaw), connected, last_t, line_count = reader.get()
         live = connected and (time.time() - last_t) < 1.0
@@ -261,8 +286,20 @@ def main():
 
         screen.fill(BG)
 
-        # Rotate board corners.
-        M = euler_to_matrix(pitch, roll, yaw)
+        # Fixed WORLD frame (does not move): X/Y/Z. Drawn dim and behind the
+        # cube so the bright body frame reads as attached to the device.
+        W_RED, W_GREEN, W_WHITE = (150, 60, 60), (60, 150, 70), (170, 170, 175)
+        world_origin2d, _ = project([0, 0, 0], scale, cx, cy)
+        world_axes = [((world_axis_len, 0, 0), W_RED, "X"),
+                      ((0, world_axis_len, 0), W_GREEN, "Y"),
+                      ((0, 0, world_axis_len), W_WHITE, "Z")]
+        for vec, col, name in world_axes:
+            tip2d, _ = project(list(vec), scale, cx, cy)
+            pygame.draw.line(screen, col, world_origin2d, tip2d, 2)
+            screen.blit(small.render(name, True, col), (tip2d[0] + 4, tip2d[1] - 8))
+
+        # Rotate board corners. Apply calibration offset: M = offset * raw.
+        M = matmul(offset, euler_to_matrix(pitch, roll, yaw))
         pts3d = [apply(M, c) for c in corners]
         proj = [project(p, scale, cx, cy) for p in pts3d]
         pts2d = [pp[0] for pp in proj]
@@ -282,10 +319,10 @@ def main():
             pygame.draw.polygon(screen, (20, 20, 24), poly, 2)
 
         # Body-fixed axes: rotate WITH the board so they stick to the cube.
-        # X red, Y green, Z white, emanating from the board center.
-        axis_body = [((axis_len, 0, 0), RED, "X"),
-                     ((0, axis_len, 0), GREEN, "Y"),
-                     ((0, 0, axis_len), WHITE, "Z")]
+        # X' red, Y' green, Z' white (primed = device frame), from board center.
+        axis_body = [((axis_len, 0, 0), RED, "X'"),
+                     ((0, axis_len, 0), GREEN, "Y'"),
+                     ((0, 0, axis_len), WHITE, "Z'")]
         center2d, _ = project(apply(M, [0, 0, 0]), scale, cx, cy)
         for vec, col, name in axis_body:
             tip3d = apply(M, list(vec))
@@ -307,7 +344,7 @@ def main():
         screen.blit(small.render(status, True, scol), (16, 12))
         rate_str = f"{fps:4.0f} FPS   {data_hz:4.0f} Hz data"
         screen.blit(small.render(rate_str, True, GREY), (W - 230, 12))
-        screen.blit(small.render("scroll / +- : zoom    Esc/Q : quit", True, GREY), (W - 290, 32))
+        screen.blit(small.render("C: zero/calibrate   R: reset   scroll/+-: zoom   Esc/Q: quit", True, GREY), (W - 470, 32))
 
         pygame.display.flip()
         clock.tick(120)
