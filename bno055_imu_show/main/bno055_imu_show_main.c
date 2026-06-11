@@ -1,16 +1,20 @@
 /*
  * bno055_imu_show_main.c
  *
- * Reads pitch / roll / yaw (Euler angles) from a Bosch BNO055 (DFRobot SEN0253
- * "10 DOF IMU AHRS") over I2C using the ESP-IDF v5.x i2c_master driver, and
- * prints them once per cycle in the exact serial format expected by the DFRobot
- * "Euler angle visual tool" / imu_show visualizer:
+ * Reads the fused orientation quaternion and calibration status from a Bosch
+ * BNO055 (DFRobot SEN0253 "10 DOF IMU AHRS") over I2C using the ESP-IDF v5.x
+ * i2c_master driver, and prints them once per cycle as a minimal, label-free,
+ * comma-separated line for the imu_view.py visualizer:
  *
- *     pitch:<f> roll:<f> yaw:<f>\r\n   at 115200 baud
+ *     qw,qx,qy,qz,sys,gyr,acc,mag\r\n   at 115200 baud
+ *
+ * qw..qz are the normalized unit quaternion (%.4f); sys/gyr/acc/mag are the
+ * 0-3 calibration levels. Rotating from the quaternion avoids the gimbal lock
+ * that Euler angles hit near +/-90 deg pitch.
  *
  * Structured after the ESP-IDF i2c_basic example, but targeting the BNO055
  * (addr 0x28, chip id 0xA0) instead of the MPU9250. The BNO055 performs sensor
- * fusion on-chip in NDOF mode, so we just read the fused Euler registers.
+ * fusion on-chip in NDOF mode, so we just read the fused quaternion registers.
  *
  * Steady-state loop performs no heap allocation -> nothing to leak.
  */
@@ -39,6 +43,8 @@
 #define BNO055_REG_EUL_HEAD_LSB  0x1A        /* Euler X (heading / yaw)      */
 #define BNO055_REG_EUL_ROLL_LSB  0x1C        /* Euler Y (roll)               */
 #define BNO055_REG_EUL_PITCH_LSB 0x1E        /* Euler Z (pitch)              */
+#define BNO055_REG_QUA_DATA_W_LSB 0x20       /* Quaternion W,X,Y,Z (8 bytes) */
+#define BNO055_REG_CALIB_STAT    0x35        /* SYS/GYR/ACC/MAG, 2 bits each */
 #define BNO055_REG_UNIT_SEL      0x3B
 #define BNO055_REG_OPR_MODE      0x3D
 #define BNO055_REG_PWR_MODE      0x3E
@@ -52,6 +58,9 @@
 
 /* Euler output: 1 degree = 16 LSB (datasheet 3.6.5.4, default unit). */
 #define BNO055_EUL_LSB_PER_DEG   16.0f
+
+/* Quaternion output: unit quaternion = 2^14 LSB (datasheet 3.6.5.5). */
+#define BNO055_QUAT_LSB          16384.0f
 
 static const char *TAG = "bno055";
 
@@ -138,35 +147,57 @@ static esp_err_t bno_init(void)
     return ESP_OK;
 }
 
-/* Read the three Euler registers (6 bytes, contiguous from 0x1A) in one burst
- * and convert to degrees. */
-static esp_err_t bno_read_euler(float *pitch, float *roll, float *yaw)
+/* Read the four quaternion registers (8 bytes, contiguous from 0x20) in one
+ * burst and convert to a normalized unit quaternion. Register order is
+ * W, X, Y, Z, each a little-endian int16 (datasheet 4.3.x). */
+static esp_err_t bno_read_quaternion(float *w, float *x, float *y, float *z)
 {
-    uint8_t raw[6];
-    esp_err_t err = bno_read(BNO055_REG_EUL_HEAD_LSB, raw, sizeof(raw));
+    uint8_t raw[8];
+    esp_err_t err = bno_read(BNO055_REG_QUA_DATA_W_LSB, raw, sizeof(raw));
     if (err != ESP_OK) {
         return err;
     }
 
-    int16_t head = (int16_t)((raw[1] << 8) | raw[0]);   /* 0x1A/0x1B */
-    int16_t rol  = (int16_t)((raw[3] << 8) | raw[2]);   /* 0x1C/0x1D */
-    int16_t pit  = (int16_t)((raw[5] << 8) | raw[4]);   /* 0x1E/0x1F */
+    int16_t qw = (int16_t)((raw[1] << 8) | raw[0]);   /* 0x20/0x21 */
+    int16_t qx = (int16_t)((raw[3] << 8) | raw[2]);   /* 0x22/0x23 */
+    int16_t qy = (int16_t)((raw[5] << 8) | raw[4]);   /* 0x24/0x25 */
+    int16_t qz = (int16_t)((raw[7] << 8) | raw[6]);   /* 0x26/0x27 */
 
-    *yaw   = head / BNO055_EUL_LSB_PER_DEG;
-    *roll  = rol  / BNO055_EUL_LSB_PER_DEG;
-    *pitch = pit  / BNO055_EUL_LSB_PER_DEG;
+    *w = qw / BNO055_QUAT_LSB;
+    *x = qx / BNO055_QUAT_LSB;
+    *y = qy / BNO055_QUAT_LSB;
+    *z = qz / BNO055_QUAT_LSB;
+    return ESP_OK;
+}
+
+/* Read the single CALIB_STAT byte and unpack its four 2-bit fields. Each value
+ * is 0 (uncalibrated) to 3 (fully calibrated). In NDOF the fused quaternion is
+ * only trustworthy as an absolute orientation once these reach 3, so we stream
+ * them for the visualizer to display. */
+static esp_err_t bno_read_calib(uint8_t *sys, uint8_t *gyr, uint8_t *acc,
+                                uint8_t *mag)
+{
+    uint8_t c = 0;
+    esp_err_t err = bno_read(BNO055_REG_CALIB_STAT, &c, 1);
+    if (err != ESP_OK) {
+        return err;
+    }
+    *sys = (c >> 6) & 0x03;
+    *gyr = (c >> 4) & 0x03;
+    *acc = (c >> 2) & 0x03;
+    *mag = c & 0x03;
     return ESP_OK;
 }
 
 void app_main(void)
 {
     /* Belt-and-suspenders with sdkconfig: silence any IDF logging on the
-     * console UART so the only thing we emit is the data lines below. The
-     * DFRobot visualizer's parser falls out of sync on any non-"pitch:" line
-     * and then drops input for seconds (the symptom: model updates only every
-     * 20-30 s). The ESP-ROM boot banner is printed by hardware before app_main
-     * and cannot be suppressed in firmware; reset the board and wait ~3 s
-     * before clicking Connect so only clean data is flowing. */
+     * console UART so the only thing we emit is the data lines below. A strict
+     * line parser falls out of sync on any unexpected line and then drops input
+     * for seconds (the symptom: model updates only every 20-30 s). The ESP-ROM
+     * boot banner is printed by hardware before app_main and cannot be
+     * suppressed in firmware; the visualizer ignores any line that is not a
+     * valid data line, so it is robust to the banner regardless. */
     esp_log_level_set("*", ESP_LOG_NONE);
 
     /* ---- I2C master bus + device, created once ------------------------- */
@@ -200,20 +231,23 @@ void app_main(void)
     }
 
     /* ---- Steady-state loop: no allocation, fixed stack buffers --------- */
-    float pitch, roll, yaw;
-    char line[64];
+    float qw, qx, qy, qz;
+    uint8_t sys, gyr, acc, mag;
+    char line[80];
     while (1) {
-        esp_err_t err = bno_read_euler(&pitch, &roll, &yaw);
-        if (err == ESP_OK) {
-            /* The DFRobot tool was written against the Arduino demo, whose
-             * Serial.println() emits CR+LF ("\r\n"). The sniffer confirmed our
-             * stream is otherwise byte-identical to that demo, so we match its
-             * terminator exactly. We write the line as one buffered fwrite and
-             * append "\r\n" ourselves; CONFIG_LIBC_STDOUT_LINE_ENDING_LF in
-             * sdkconfig.defaults stops the console from adding a second CR. */
+        esp_err_t qerr = bno_read_quaternion(&qw, &qx, &qy, &qz);
+        esp_err_t cerr = bno_read_calib(&sys, &gyr, &acc, &mag);
+        if (qerr == ESP_OK && cerr == ESP_OK) {
+            /* Minimal comma-separated line, no field labels, to keep the byte
+             * count low at high stream rates. Order is fixed:
+             *   qw,qx,qy,qz,sys,gyr,acc,mag\r\n
+             * Quaternion as %.4f (ample for a unit quaternion); cal levels are
+             * single digits 0-3. We match the Arduino-style CR+LF terminator;
+             * CONFIG_LIBC_STDOUT_LINE_ENDING_LF in sdkconfig.defaults stops the
+             * console from adding a second CR. */
             int n = snprintf(line, sizeof(line),
-                             "pitch:%.3f roll:%.3f yaw:%.3f\r\n",
-                             pitch, roll, yaw);
+                             "%.4f,%.4f,%.4f,%.4f,%u,%u,%u,%u\r\n",
+                             qw, qx, qy, qz, sys, gyr, acc, mag);
             if (n > 0) {
                 fwrite(line, 1, (size_t)n, stdout);
                 fflush(stdout);

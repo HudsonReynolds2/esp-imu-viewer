@@ -4,14 +4,21 @@ imu_view.py - live 3D orientation visualizer for the BNO055 / SEN0253.
 
 Replaces the fragile DFRobot "Euler angle visual tool.exe". Reads the ESP32's
 serial stream directly, ignores anything that isn't a valid
-    pitch:<f> roll:<f> yaw:<f>
+    qw,qx,qy,qz,sys,gyr,acc,mag
 line (so the ESP-ROM boot banner can never desync it), and survives USB-CDC
 re-enumeration (the PermissionError/ClearCommError you hit on reset) by
 reopening the port automatically.
 
+The board is rotated directly from the fused unit quaternion, which avoids the
+gimbal lock that Euler angles hit near +/-90 deg pitch. Pitch/roll/yaw are still
+shown numerically, but those are derived from the quaternion purely for display:
+the displayed degrees can go singular near +/-90 deg while the 3D board stays
+correct, because the board never goes through Euler.
+
 Renders a board (green top / red bottom) with X(red) Y(green) Z(white) axes
-that rotates in real time, plus a numeric readout. No virtual COM ports, no
-reflashing.
+that rotates in real time, a numeric readout, and the four BNO055 calibration
+levels (sys/gyr/acc/mag, 0-3). In NDOF the absolute orientation is only
+trustworthy once these reach 3, so they are colored red until then.
 
 Setup (in your venv):
     python -m pip install pyserial pygame
@@ -22,12 +29,11 @@ Run:
 
 Controls: close the window or press Esc/Q to quit.
 
-Notes on conventions: the firmware maps the BNO055 Euler registers as
-    yaw   = EUL_X (heading)
-    roll  = EUL_Y
-    pitch = EUL_Z
-matching the DFRobot demo. If a particular axis feels inverted for how your
-board is mounted, flip its sign in euler_to_matrix() (clearly marked).
+Notes on conventions: the firmware streams the BNO055 fused quaternion in its
+native W,X,Y,Z register order. quat_to_matrix() builds the rotation matrix from
+it directly. If a particular axis feels inverted for how your board is mounted,
+flip the corresponding component sign where the quaternion is unpacked (clearly
+marked in quat_to_matrix()).
 """
 import argparse
 import math
@@ -44,7 +50,11 @@ except ImportError:
     print("pygame is not installed. In your venv run:  python -m pip install pygame")
     sys.exit(1)
 
-GOOD = re.compile(r'^pitch:(-?\d+\.\d+) roll:(-?\d+\.\d+) yaw:(-?\d+\.\d+)$')
+# qw,qx,qy,qz (signed floats) then four 0-3 cal digits. Anchored so the boot
+# banner and any stray line can never match.
+GOOD = re.compile(
+    r'^(-?\d+\.\d+),(-?\d+\.\d+),(-?\d+\.\d+),(-?\d+\.\d+),([0-3]),([0-3]),([0-3]),([0-3])$'
+)
 
 # ----------------------------------------------------------------------------
 # Serial reader thread: keeps the latest (pitch, roll, yaw) in a shared slot.
@@ -56,7 +66,8 @@ class SerialReader(threading.Thread):
         self.port = port
         self.baud = baud
         self.lock = threading.Lock()
-        self.angles = (0.0, 0.0, 0.0)   # pitch, roll, yaw
+        self.quat = (1.0, 0.0, 0.0, 0.0)   # w, x, y, z (identity)
+        self.calib = (0, 0, 0, 0)          # sys, gyr, acc, mag
         self.connected = False
         self.last_line_time = 0.0
         self.line_count = 0             # total valid lines, for data-rate calc
@@ -116,9 +127,13 @@ class SerialReader(threading.Thread):
                     continue
                 m = GOOD.match(text)
                 if m:
-                    p, r, y = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+                    qw, qx, qy, qz = (float(m.group(1)), float(m.group(2)),
+                                      float(m.group(3)), float(m.group(4)))
+                    cs, cg, ca, cm = (int(m.group(5)), int(m.group(6)),
+                                      int(m.group(7)), int(m.group(8)))
                     with self.lock:
-                        self.angles = (p, r, y)
+                        self.quat = (qw, qx, qy, qz)
+                        self.calib = (cs, cg, ca, cm)
                         self.last_line_time = time.time()
                         self.line_count += 1
         if ser:
@@ -129,52 +144,80 @@ class SerialReader(threading.Thread):
 
     def get(self):
         with self.lock:
-            return self.angles, self.connected, self.last_line_time, self.line_count
+            return (self.quat, self.calib, self.connected,
+                    self.last_line_time, self.line_count)
 
     def stop(self):
         self._stop = True
 
 
 # ----------------------------------------------------------------------------
-# Minimal 3D math (no numpy needed).
+# Minimal 3D + quaternion math (no numpy needed).
 # ----------------------------------------------------------------------------
-def euler_to_matrix(pitch_deg, roll_deg, yaw_deg):
-    # Convert to radians. Flip any sign here if an axis feels inverted.
-    p = math.radians(pitch_deg)
-    r = math.radians(roll_deg)
-    y = math.radians(yaw_deg)
+def quat_normalize(q):
+    w, x, y, z = q
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n < 1e-9:
+        return (1.0, 0.0, 0.0, 0.0)
+    return (w / n, x / n, y / n, z / n)
 
-    cp, sp = math.cos(p), math.sin(p)
-    cr, sr = math.cos(r), math.sin(r)
-    cy, sy = math.cos(y), math.sin(y)
 
-    # Rotation matrices.
-    # Yaw about Z, pitch about Y, roll about X (Z-Y-X). Tweak order/signs if
-    # your mounting differs.
-    Rz = [[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]]
-    Ry = [[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]]
-    Rx = [[1, 0, 0], [0, cr, -sr], [0, sr, cr]]
+def quat_conjugate(q):
+    w, x, y, z = q
+    return (w, -x, -y, -z)
 
-    def mul(A, B):
-        return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
 
-    return mul(Rz, mul(Ry, Rx))
+def quat_mul(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def quat_to_matrix(q):
+    # Build a rotation matrix directly from a (normalized) unit quaternion.
+    # This is the gimbal-lock-free path: the board is rotated from q and never
+    # passes through Euler angles. To invert an axis for a different physical
+    # mounting, negate that component here (e.g. x = -x) rather than touching
+    # the firmware.
+    w, x, y, z = quat_normalize(q)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return [
+        [1 - 2 * (yy + zz), 2 * (xy - wz),     2 * (xz + wy)],
+        [2 * (xy + wz),     1 - 2 * (xx + zz), 2 * (yz - wx)],
+        [2 * (xz - wy),     2 * (yz + wx),     1 - 2 * (xx + yy)],
+    ]
+
+
+def quat_to_euler(q):
+    # Derive pitch/roll/yaw (degrees) from the quaternion FOR DISPLAY ONLY.
+    # These numbers go singular near +/-90 deg pitch (that is gimbal lock); the
+    # 3D board does not, because it rotates from the quaternion above. Returned
+    # as (pitch, roll, yaw) to match the old readout layout.
+    w, x, y, z = quat_normalize(q)
+    # roll (about X)
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+    # pitch (about Y) with clamp at the singularity
+    sinp = 2 * (w * y - z * x)
+    sinp = max(-1.0, min(1.0, sinp))
+    pitch = math.degrees(math.asin(sinp))
+    # yaw (about Z)
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+    return pitch, roll, yaw
 
 
 def apply(M, v):
     return [sum(M[i][k] * v[k] for k in range(3)) for i in range(3)]
-
-
-def matmul(A, B):
-    return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
-
-
-def transpose(M):
-    # For a rotation matrix, the transpose is its inverse.
-    return [[M[j][i] for j in range(3)] for i in range(3)]
-
-
-IDENTITY = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
 
 
 def project(v, scale, cx, cy):
@@ -243,10 +286,14 @@ def main():
     # World axes drawn fixed in space. Slightly longer so they read as the frame.
     world_axis_len = 170
 
-    # Calibration: offset matrix applied as offset * current. Pressing C sets
-    # offset = inverse(current), which zeroes the displayed orientation so the
-    # device frame coincides with the world frame at that instant.
-    offset = [row[:] for row in IDENTITY]
+    # Calibration: quaternion offset applied as q_offset * q_current. Pressing
+    # C sets q_offset = conjugate(current), which zeroes the orientation so the
+    # device frame coincides with the world frame at that instant. Gimbal-lock
+    # free, unlike the old matrix-from-Euler approach.
+    q_offset = (1.0, 0.0, 0.0, 0.0)   # identity
+    quat = (1.0, 0.0, 0.0, 0.0)       # latest raw quaternion (pre-init)
+    calib = (0, 0, 0, 0)              # latest cal levels (pre-init)
+    q_cal = (1.0, 0.0, 0.0, 0.0)
 
     running = True
     while running:
@@ -265,12 +312,12 @@ def main():
                 scale = max(SCALE_MIN, min(SCALE_MAX, scale * factor))
             elif e.type == pygame.KEYDOWN and e.key == pygame.K_c:
                 # Calibrate: make the current device orientation the new zero.
-                offset = transpose(euler_to_matrix(pitch, roll, yaw))
+                q_offset = quat_conjugate(quat)
             elif e.type == pygame.KEYDOWN and e.key == pygame.K_r:
                 # Reset calibration back to raw orientation.
-                offset = [row[:] for row in IDENTITY]
+                q_offset = (1.0, 0.0, 0.0, 0.0)
 
-        (pitch, roll, yaw), connected, last_t, line_count = reader.get()
+        (quat, calib, connected, last_t, line_count) = reader.get()
         live = connected and (time.time() - last_t) < 1.0
 
         # Update FPS and data-rate counters on a rolling window.
@@ -298,8 +345,10 @@ def main():
             pygame.draw.line(screen, col, world_origin2d, tip2d, 2)
             screen.blit(small.render(name, True, col), (tip2d[0] + 4, tip2d[1] - 8))
 
-        # Rotate board corners. Apply calibration offset: M = offset * raw.
-        M = matmul(offset, euler_to_matrix(pitch, roll, yaw))
+        # Rotate board corners. Apply calibration: q = q_offset * q_current,
+        # then build the matrix from the quaternion (gimbal-lock free).
+        q_cal = quat_mul(q_offset, quat)
+        M = quat_to_matrix(q_cal)
         pts3d = [apply(M, c) for c in corners]
         proj = [project(p, scale, cx, cy) for p in pts3d]
         pts2d = [pp[0] for pp in proj]
@@ -331,13 +380,37 @@ def main():
             label = small.render(name, True, col)
             screen.blit(label, (tip2d[0] + 4, tip2d[1] - 8))
 
-        # Readout (bottom-left, like the tool).
-        def txt(s, color, x, y):
-            screen.blit(font.render(s, True, color), (x, y))
+        # Readout (bottom-left, like the tool). Euler is derived from the
+        # calibrated quaternion purely for display; the board itself rotates
+        # from the quaternion, so these numbers can go singular near +/-90 deg
+        # pitch while the 3D view stays correct.
+        def txt(s, color, x, y, fnt=font):
+            screen.blit(fnt.render(s, True, color), (x, y))
 
-        txt(f"Pitch: {pitch:8.3f}", WHITE, 16, H - 96)
-        txt(f"Roll:  {roll:8.3f}", RED, 16, H - 68)
-        txt(f"Yaw:   {yaw:8.3f}", GREEN, 16, H - 40)
+        qw, qx, qy, qz = quat
+        pitch, roll, yaw = quat_to_euler(q_cal)
+
+        txt(f"Pitch: {pitch:8.3f}", WHITE, 16, H - 150)
+        txt(f"Roll:  {roll:8.3f}", RED, 16, H - 122)
+        txt(f"Yaw:   {yaw:8.3f}", GREEN, 16, H - 94)
+        txt(f"q: {qw:7.4f} {qx:7.4f} {qy:7.4f} {qz:7.4f}", WHITE, 16, H - 60, small)
+
+        # Quaternion norm sanity: a healthy unit quaternion is |q| ~ 1.0. A
+        # drift flags a parse/scale problem or all-zero data (sensor not yet in
+        # fusion). Warn in amber when it strays.
+        qnorm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+        norm_ok = abs(qnorm - 1.0) < 0.05
+        ncol = GREY if norm_ok else (220, 180, 60)
+        txt(f"|q|={qnorm:5.3f}", ncol, 16, H - 36, small)
+
+        # Calibration levels (sys/gyr/acc/mag): red until 3, green at 3. In NDOF
+        # the absolute orientation is only trustworthy once all reach 3.
+        cs, cg, ca, cm = calib
+        cal_x = 150
+        txt("cal", GREY, cal_x, H - 36, small)
+        for i, (lbl, lvl) in enumerate((("S", cs), ("G", cg), ("A", ca), ("M", cm))):
+            ccol = GREEN if lvl == 3 else RED
+            txt(f"{lbl}{lvl}", ccol, cal_x + 36 + i * 38, H - 36, small)
 
         status = "LIVE" if live else ("connected, no data" if connected else f"waiting for {args.port}...")
         scol = (60, 220, 90) if live else (220, 180, 60)
@@ -355,3 +428,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
