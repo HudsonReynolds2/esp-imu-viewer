@@ -8,8 +8,8 @@ bno055_imu_show/dependencies.lock
 *.elf
 *.map
 
-# sdkconfig.defaults IS tracked (it carries the LF / log settings); only the
-# generated sdkconfig is ignored above.
+# Note: the generated sdkconfig is intentionally ignored. The required settings
+# are documented in the README (set them via `idf.py menuconfig`).
 
 # ---- Python ----
 .venv/
