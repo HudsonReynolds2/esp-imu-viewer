@@ -152,6 +152,12 @@ Calibrate (C) snapshots the current orientation and makes it the new reference, 
 the device frame (X'/Y'/Z') aligns with the world frame (X/Y/Z) and all motion after
 that is measured relative to that pose.
 
+### Demo Video
+[![Demo Video](https://img.youtube.com/vi/4d74bNJ_7S8/maxresdefault.jpg)](https://youtu.be/4d74bNJ_7S8) 
+
+#### More thorough testing of the sensor, and further upgrades to the tool, should be made. 
+
+
 ## Adapting or upgrading
 
 A few common changes and where to make them:
