@@ -100,13 +100,11 @@ class SerialReader(threading.Thread):
         self.line_count = 0             # total valid lines, for data-rate calc
         # Stream-quality stats computed from seq + device timestamp.
         self.dropped = 0                # missed samples (seq gaps)
-        self.dups = 0                   # consecutive identical quaternions
         self.dev_hz = 0.0               # rate from device timestamps
         self.jitter_ms = 0.0            # stddev of inter-sample dt (device clock)
         self.version_ok = True          # False if firmware tag != WIRE_VERSION
         self._prev_seq = None
         self._prev_t_us = None
-        self._prev_quat = None
         self._dt_window = []            # recent inter-sample dt, for jitter
         self._stop = False
 
@@ -225,14 +223,7 @@ class SerialReader(threading.Thread):
                         self.jitter_ms = (var ** 0.5) / 1000.0
             self._prev_t_us = t_us
 
-            # Duplicate fusion-sample detection: an identical quaternion to the
-            # previous line means the BNO055 had not refreshed (we polled faster
-            # than its 100 Hz fusion update). A stationary sensor will also repeat
-            # values, so this is a coarse "are we oversampling" hint, not an error;
-            # it is only meaningful while the board is actually moving.
-            if self._prev_quat is not None and quat == self._prev_quat:
-                self.dups += 1
-            self._prev_quat = quat
+
 
     def get(self):
         with self.lock:
@@ -244,7 +235,6 @@ class SerialReader(threading.Thread):
                 "last_t": self.last_line_time,
                 "line_count": self.line_count,
                 "dropped": self.dropped,
-                "dups": self.dups,
                 "dev_hz": self.dev_hz,
                 "jitter_ms": self.jitter_ms,
                 "version_ok": self.version_ok,
@@ -351,8 +341,16 @@ def main():
 
     pygame.init()
     W, H = 900, 640
-    screen = pygame.display.set_mode((W, H))
+    # RESIZABLE enables the maximize button and window dragging-to-resize (the
+    # grayed-out maximize was because the default window has no resize flag).
+    # vsync=1 syncs presentation to the monitor's refresh (e.g. 144 Hz) with no
+    # tearing and no artificial cap; we always draw the freshest sample, so the
+    # board reflects new data the instant it arrives with no added latency.
+    flags = pygame.RESIZABLE
+    screen = pygame.display.set_mode((W, H), flags, vsync=1)
     pygame.display.set_caption(f"IMU view - {args.port}")
+    fullscreen = False
+    windowed_size = (W, H)        # remembered so we can restore from fullscreen
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("consolas", 22)
     small = pygame.font.SysFont("consolas", 16)
@@ -363,7 +361,8 @@ def main():
     WHITE = (230, 230, 230)
     GREY = (90, 90, 100)
 
-    cx, cy = W // 2, H // 2 - 20
+    # Center is recomputed from the live surface each frame, so it stays correct
+    # after a resize or fullscreen toggle.
     scale = 2.2
     SCALE_MIN, SCALE_MAX = 0.4, 12.0   # zoom limits
 
@@ -395,6 +394,13 @@ def main():
     quat = (1.0, 0.0, 0.0, 0.0)       # latest raw quaternion (pre-init)
     calib = (0, 0, 0, 0)              # latest cal levels (pre-init)
     q_cal = (1.0, 0.0, 0.0, 0.0)
+
+    def set_mode(size, fs):
+        # Recreate the display surface for a resize or fullscreen toggle, keeping
+        # vsync on so presentation stays tear-free at the monitor refresh rate.
+        if fs:
+            return pygame.display.set_mode((0, 0), pygame.FULLSCREEN, vsync=1)
+        return pygame.display.set_mode(size, pygame.RESIZABLE, vsync=1)
 
     # Per-sensor display toggles (visualizer-side selection). The firmware still
     # streams everything; this only controls what the readout shows. Number keys
@@ -432,6 +438,22 @@ def main():
             elif e.type == pygame.KEYDOWN and e.key in group_keys:
                 g = group_keys[e.key]
                 show[g] = not show[g]
+            elif e.type == pygame.KEYDOWN and e.key in (pygame.K_f, pygame.K_F11):
+                # Toggle fullscreen. Remember the windowed size to restore to.
+                fullscreen = not fullscreen
+                if fullscreen:
+                    windowed_size = screen.get_size()
+                    screen = set_mode(windowed_size, True)
+                else:
+                    screen = set_mode(windowed_size, False)
+            elif e.type == pygame.VIDEORESIZE and not fullscreen:
+                # User dragged the window edge or hit maximize.
+                screen = set_mode((max(480, e.w), max(360, e.h)), False)
+
+        # Live surface dimensions: recomputed every frame so resize/fullscreen
+        # take effect immediately and the board stays centered.
+        W, H = screen.get_size()
+        cx, cy = W // 2, H // 2 - 20
 
         st = reader.get()
         quat = st["quat"]
@@ -554,11 +576,10 @@ def main():
         screen.blit(small.render(status, True, scol), (16, 12))
 
         # Stream-quality stats (top-right). dev_hz/jitter come from the device
-        # microsecond timestamp (authoritative); dropped from seq gaps; dups are
-        # repeated quaternions (polling faster than the 100 Hz fusion update).
+        # microsecond timestamp (authoritative); dropped from seq gaps.
         rate_str = f"{fps:4.0f} FPS render   {st['dev_hz']:5.1f} Hz dev"
         screen.blit(small.render(rate_str, True, GREY), (W - 260, 12))
-        q_str = f"jit {st['jitter_ms']:4.2f}ms  drop {st['dropped']}  dup {st['dups']}"
+        q_str = f"jitter {st['jitter_ms']:4.2f} ms    dropped {st['dropped']}"
         screen.blit(small.render(q_str, True, GREY), (W - 260, 32))
         if not st["version_ok"]:
             warn = small.render("firmware/visualizer version mismatch", True, (230, 80, 80))
@@ -591,11 +612,11 @@ def main():
             panel_y += 22
 
         screen.blit(small.render(
-            "C: zero  R: reset  1-7: toggle sensors  scroll/+-: zoom  Esc/Q: quit",
+            "C: zero  R: reset  1-7: sensors  F: fullscreen  scroll/+-: zoom  Esc/Q: quit",
             True, GREY), (W - 470, H - 20))
 
         pygame.display.flip()
-        clock.tick(120)
+        clock.tick()   # uncapped; vsync paces presentation to the monitor
 
     reader.stop()
     pygame.quit()
@@ -603,4 +624,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

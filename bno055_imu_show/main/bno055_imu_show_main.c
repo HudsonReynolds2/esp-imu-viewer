@@ -36,14 +36,15 @@
  * wired the sensor to different pins. */
 #define I2C_MASTER_SCL_IO        7
 #define I2C_MASTER_SDA_IO        6
-#define I2C_MASTER_FREQ_HZ       100000      /* 100 kHz, safe default. The
-                                              * BNO055 also supports 400 kHz
-                                              * (fast mode) but clock-stretches
-                                              * heavily; 100 kHz already leaves
-                                              * ample slack for the 46-byte
-                                              * burst within the 10 ms window.
-                                              * Raise to 400000 only as a
-                                              * measured experiment, alone. */
+#define I2C_MASTER_FREQ_HZ       400000      /* 400 kHz (fast mode). The 46-byte
+                                              * burst at 100 kHz plus the
+                                              * BNO055's clock-stretching exceeds
+                                              * the 10 ms window and caps the
+                                              * rate (~71 Hz). 400 kHz cuts the
+                                              * transfer ~4x so the read fits
+                                              * inside 10 ms and the loop holds
+                                              * 100 Hz. The BNO055 supports fast
+                                              * mode (datasheet 4.1). */
 #define I2C_MASTER_TIMEOUT_MS    1000
 
 #define BNO055_ADDR              0x28        /* COM3 low on DFRobot board    */
@@ -323,10 +324,31 @@ void app_main(void)
      * The firmware always emits every field; selecting/deselecting sensors is
      * done visualizer-side for now. We match the Arduino-style CR+LF; the
      * CONFIG_LIBC_STDOUT_LINE_ENDING_LF sdkconfig option stops the console from
-     * adding a second CR. Buffer is sized for the worst-case line length. */
+     * adding a second CR. Buffer is sized for the worst-case line length.
+     *
+     * Timing: xTaskDelayUntil() schedules the next wake at a FIXED interval
+     * from the previous wake, so the sensor-read and print time does NOT add on
+     * top of the period (vTaskDelay would do that, dragging the rate down to
+     * ~50-60 Hz). This requires a fine FreeRTOS tick: with the default 100 Hz
+     * tick, a 10 ms period rounds to one tick and cannot resolve 100 Hz, so set
+     * CONFIG_FREERTOS_HZ=1000 in menuconfig (then pdMS_TO_TICKS(10) = 10 ticks
+     * and the loop holds a true 100 Hz). */
     bno_sample_t s;
     uint32_t seq = 0;
     char line[256];
+    const TickType_t period = pdMS_TO_TICKS(10);   /* 100 Hz */
+    TickType_t wake = xTaskGetTickCount();
+
+    /* One-time diagnostic on the data stream itself (so it shows even with IDF
+     * logging disabled): report the COMPILED FreeRTOS tick rate and how many
+     * ticks a 10 ms period actually resolves to. If tick_hz is not 1000 or
+     * period_ticks is not 10, the CONFIG_FREERTOS_HZ=1000 change did not make it
+     * into this binary, which is what caps the loop near 71 Hz. The visualizer
+     * ignores any line it cannot parse, so this diag line is harmless there. */
+    printf("# diag tick_hz=%d period_ticks=%u\r\n",
+           (int)configTICK_RATE_HZ, (unsigned)period);
+    fflush(stdout);
+
     while (1) {
         int64_t t_us = esp_timer_get_time();      /* device clock, pre-read   */
         esp_err_t err = bno_read_all(&s);
@@ -355,6 +377,7 @@ void app_main(void)
             }
             seq++;   /* wrap-safe: readers compute (cur - prev) in uint32 */
         }
-        vTaskDelay(pdMS_TO_TICKS(10));   /* ~100 Hz, matches BNO055 NDOF fusion */
+        /* Sleep until the next 10 ms boundary regardless of read/print time. */
+        xTaskDelayUntil(&wake, period);
     }
 }
