@@ -33,6 +33,15 @@
 #include "driver/usb_serial_jtag.h"
 
 /* ---- User configuration ------------------------------------------------- */
+/* DIAG: compile-time gate for the timing diagnostics (the boot "# diag" line
+ * and the every-100th-sample "# t read_us/print_us/busy_us" line). These are
+ * the instrumentation that found the blocking-USB-write bottleneck; keep the
+ * code, but default OFF so the production stream carries only v2 data lines.
+ * Set to 1 and rebuild to re-measure loop timing. Healthy reference numbers
+ * from the working 100 Hz build: read_us ~1600-7000, print_us ~850-950,
+ * busy_us ~2500-7800 (budget is 10000 us). */
+#define DIAG 0
+
 /* XIAO ESP32C3 silkscreen D4 = GPIO6 (SDA), D5 = GPIO7 (SCL). Change if you
  * wired the sensor to different pins. */
 #define I2C_MASTER_SCL_IO        7
@@ -354,6 +363,7 @@ void app_main(void)
     const TickType_t period = pdMS_TO_TICKS(10);   /* 100 Hz */
     TickType_t wake = xTaskGetTickCount();
 
+#if DIAG
     /* One-time diagnostic on the data stream itself (so it shows even with IDF
      * logging disabled): report the COMPILED FreeRTOS tick rate and how many
      * ticks a 10 ms period actually resolves to. If tick_hz is not 1000 or
@@ -365,11 +375,14 @@ void app_main(void)
     if (dn > 0) {
         usb_serial_jtag_write_bytes(line, (size_t)dn, pdMS_TO_TICKS(20));
     }
+#endif
 
     while (1) {
         int64_t t_us = esp_timer_get_time();      /* device clock, pre-read   */
         esp_err_t err = bno_read_all(&s);
+#if DIAG
         int64_t t_after_read = esp_timer_get_time();
+#endif
         if (err == ESP_OK) {
             int n = snprintf(line, sizeof(line),
                 "v2,%lu,%lld,"
@@ -397,12 +410,15 @@ void app_main(void)
             }
             seq++;   /* wrap-safe: readers compute (cur - prev) in uint32 */
         }
+
+#if DIAG
         int64_t t_after_print = esp_timer_get_time();
 
-        /* TEMP DIAGNOSTIC: every 100th sample, emit timing in microseconds for
-         * the I2C read and for the snprintf+write, plus the total since loop
-         * top. Routed through the driver (non-blocking) so the diagnostic itself
-         * does not stall the loop. The visualizer ignores this non-data line. */
+        /* DIAGNOSTIC (compile-time gated): every 100th sample, emit timing in
+         * microseconds for the I2C read and for the snprintf+write, plus the
+         * total since loop top. Routed through the driver (non-blocking) so the
+         * diagnostic itself does not stall the loop. The visualizer ignores
+         * this non-data line. */
         if ((seq % 100) == 0) {
             char dbg[80];
             int dl = snprintf(dbg, sizeof(dbg),
@@ -414,6 +430,7 @@ void app_main(void)
                 usb_serial_jtag_write_bytes(dbg, (size_t)dl, 0);
             }
         }
+#endif
 
         /* Sleep until the next 10 ms boundary regardless of read/print time. */
         xTaskDelayUntil(&wake, period);

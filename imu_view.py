@@ -21,13 +21,18 @@ levels (sys/gyr/acc/mag, 0-3). In NDOF the absolute orientation is only
 trustworthy once these reach 3, so they are colored red until then.
 
 Setup (in your venv):
-    python -m pip install pyserial pygame
+    python -m pip install pyserial pygame numpy
 
 Run:
     python imu_view.py COM4
     python imu_view.py COM4 --baud 115200
 
-Controls: close the window or press Esc/Q to quit.
+Controls: Esc/Q quit, C zero, R reset, 1-7 numeric sensor panel, F/F11
+fullscreen, scroll/+- zoom, TAB show/hide the graph strip, A/S/D/G/H/J/K
+toggle individual graph panels (home row in GRAPH_CONFIG panel order; F is
+skipped because it is fullscreen). Graph appearance (channels, window length,
+colors, layout, y-scales) is configured in GRAPH_CONFIG at the top of this
+file.
 
 Notes on conventions: the firmware streams the BNO055 fused quaternion in its
 native W,X,Y,Z register order. quat_to_matrix() builds the rotation matrix from
@@ -47,6 +52,15 @@ try:
     import pygame
 except ImportError:
     print("pygame is not installed. In your venv run:  python -m pip install pygame")
+    sys.exit(1)
+
+# numpy backs the sample ring buffer and the graph math, and is the linear
+# algebra the Phase 3 KF/EKF will run on (decided at Phase 1 start, per the
+# handoff: filters make it worth introducing now).
+try:
+    import numpy as np
+except ImportError:
+    print("numpy is not installed. In your venv run:  python -m pip install numpy")
     sys.exit(1)
 
 # Wire format (must match the firmware). Version-prefixed positional CSV:
@@ -80,15 +94,104 @@ SENSOR_GROUPS = {
     "temp":    ["temp"],
 }
 
+# Field name -> column index in a ring-buffer row (rows are FIELDS in order).
+FIELD_IDX = {name: i for i, name in enumerate(FIELDS)}
+T_US_IDX = FIELD_IDX["t_us"]
+
+# Per-channel trace colors. Axis convention matches the 3D view: x red,
+# y green, z blue-ish; qw white; temp amber. Edit here to retheme.
+_AXIS_COLORS = {"x": (235, 80, 80), "y": (80, 220, 100), "z": (90, 140, 255)}
+CHANNEL_COLORS = {"qw": (235, 235, 235), "temp": (235, 190, 80)}
+for _names in SENSOR_GROUPS.values():
+    for _n in _names:
+        if _n not in CHANNEL_COLORS:
+            CHANNEL_COLORS[_n] = _AXIS_COLORS.get(_n[-1], (200, 200, 200))
+
+# ----------------------------------------------------------------------------
+# Graph configuration (Phase 1) - EDIT HERE to change how graphs display.
+# Panels are drawn left-to-right along the bottom strip in this order when
+# enabled. Runtime toggle keys follow the SAME order: A S D G H J K (home row,
+# skipping F = fullscreen); TAB shows/hides the whole strip. "y" is "auto"
+# (autoscale to the visible window) or a fixed (lo, hi) tuple.
+# ----------------------------------------------------------------------------
+GRAPH_CONFIG = {
+    "window_s": 10.0,       # seconds of history shown (ring capacity follows)
+    "strip_frac": 0.38,     # fraction of window height the strip occupies
+    "panel_gap": 8,         # px between/around panels
+    "autoscale_pad": 0.10,  # headroom fraction added around autoscaled data
+    "max_pts_per_px": 1,    # DISPLAY-ONLY decimation cap; never thins the data
+    "graphs_on": True,      # strip visible at startup
+    "panels": [
+        {"group": "quat",    "y": (-1.1, 1.1), "on": False},
+        {"group": "accel",   "y": "auto",      "on": True},
+        {"group": "gyro",    "y": "auto",      "on": True},
+        {"group": "mag",     "y": "auto",      "on": False},
+        {"group": "linear",  "y": "auto",      "on": False},
+        {"group": "gravity", "y": "auto",      "on": False},
+        {"group": "temp",    "y": "auto",      "on": False},
+    ],
+}
+
+
+# ----------------------------------------------------------------------------
+# Ring buffer of raw samples: the backbone of the data pipeline (handoff
+# "Architecture" section). The SerialReader fills it; consumers take windowed
+# copies: graphs read a window, the 3D view reads the latest, and the coming
+# logging (Phase 2) and filters (Phase 3) consume from the same structure.
+# Only RAW samples live here; filter outputs are derived consumer-side.
+# ----------------------------------------------------------------------------
+class RingBuffer:
+    """Thread-safe circular store of samples in a preallocated numpy array.
+
+    Rows are the FIELDS values in order (float64; t_us up to ~9e15 us stays
+    exact in a double, i.e. centuries of device uptime). `count` is the total
+    number of samples ever appended (monotonic), so a consumer can tell how
+    much is new since it last looked - the Phase 2 logger will drain by
+    tracking count, without removing anything graphs or filters still need.
+    """
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self._data = np.zeros((capacity, len(FIELDS)), dtype=np.float64)
+        self._lock = threading.Lock()
+        self._next = 0          # next write slot
+        self.count = 0          # total samples ever appended
+
+    def append(self, row):
+        with self._lock:
+            self._data[self._next] = row
+            self._next = (self._next + 1) % self.capacity
+            self.count += 1
+
+    def window(self, window_us=None):
+        """Copy of the most recent samples, oldest->newest, optionally
+        trimmed to the last window_us of device time.
+        Returns (t_us 1-D array, data 2-D array)."""
+        with self._lock:
+            n = min(self.count, self.capacity)
+            if n == 0:
+                return np.empty(0), np.empty((0, len(FIELDS)))
+            if self.count <= self.capacity:
+                out = self._data[:n].copy()
+            else:
+                out = np.vstack((self._data[self._next:],
+                                 self._data[:self._next]))
+        t = out[:, T_US_IDX]
+        if window_us is not None and t.size:
+            out = out[t >= t[-1] - window_us]
+            t = out[:, T_US_IDX]
+        return t, out
+
 # ----------------------------------------------------------------------------
 # Serial reader thread: keeps the latest (pitch, roll, yaw) in a shared slot.
 # Robust to the port disappearing on reset; ignores all non-matching lines.
 # ----------------------------------------------------------------------------
 class SerialReader(threading.Thread):
-    def __init__(self, port, baud):
+    def __init__(self, port, baud, ring=None):
         super().__init__(daemon=True)
         self.port = port
         self.baud = baud
+        self.ring = ring                   # RingBuffer of raw samples (shared)
         self.lock = threading.Lock()
         # Latest full sample as a dict keyed by FIELDS names (floats), plus the
         # quaternion broken out for convenience. Identity until first line.
@@ -192,6 +295,10 @@ class SerialReader(threading.Thread):
 
         quat = (vals["qw"], vals["qx"], vals["qy"], vals["qz"])
         calib = (int(vals["cs"]), int(vals["cg"]), int(vals["ca"]), int(vals["cm"]))
+
+        # Raw sample into the ring (its own lock). Row order == FIELDS order.
+        if self.ring is not None:
+            self.ring.append([vals[f] for f in FIELDS])
 
         with self.lock:
             self.version_ok = True
@@ -330,13 +437,127 @@ def project(v, scale, cx, cy):
     return (sx, sy), z2
 
 
+# ----------------------------------------------------------------------------
+# Graphs (Phase 1). Built as infrastructure, not a feature: a "series" is just
+# a named, time-stamped float stream, drawn as (name, color, t_us_array,
+# value_array). GraphPanel.draw() is source-agnostic, so the Phase 3 KF/EKF
+# outputs plot through this exact same path by handing the panel their own
+# (t, value) streams; series_from_ring() is merely the raw-channel source.
+# ----------------------------------------------------------------------------
+class GraphPanel:
+    BG = (14, 14, 20)
+    BORDER = (60, 60, 72)
+    GRID = (38, 38, 48)
+    LABEL = (130, 130, 140)
+
+    def __init__(self, spec):
+        self.group = spec["group"]
+        self.on = spec.get("on", True)
+        self.yspec = spec.get("y", "auto")
+        self.fields = SENSOR_GROUPS[self.group]
+
+    def series_from_ring(self, t, data):
+        """Raw-channel series for this panel's group, sliced out of the ring
+        window arrays (zero per-channel copies until draw)."""
+        if data.shape[0] == 0:
+            return []
+        return [(f, CHANNEL_COLORS.get(f, (200, 200, 200)),
+                 t, data[:, FIELD_IDX[f]]) for f in self.fields]
+
+    def draw(self, surf, rect, series, font):
+        pygame.draw.rect(surf, self.BG, rect)
+        pygame.draw.rect(surf, self.BORDER, rect, 1)
+
+        window_us = GRAPH_CONFIG["window_s"] * 1e6
+
+        # y range: fixed (lo, hi) from config, or autoscaled to the window.
+        if self.yspec == "auto":
+            vmin, vmax = math.inf, -math.inf
+            for _, _, _, vs in series:
+                if vs.size:
+                    vmin = min(vmin, float(vs.min()))
+                    vmax = max(vmax, float(vs.max()))
+            if not math.isfinite(vmin):
+                vmin, vmax = -1.0, 1.0
+            pad = (vmax - vmin) * GRAPH_CONFIG["autoscale_pad"]
+            if pad <= 0.0:
+                pad = 0.5            # flat line: give it headroom
+            vmin -= pad
+            vmax += pad
+        else:
+            vmin, vmax = self.yspec
+        vspan = vmax - vmin
+
+        # Newest sample defines the right edge; traces scroll leftward. Always
+        # the freshest data, no interpolation (render model: see handoff).
+        t_right = max((ts[-1] for _, _, ts, _ in series if ts.size),
+                      default=None)
+        if t_right is not None:
+            px_per_us = rect.w / window_us
+            max_pts = rect.w * GRAPH_CONFIG["max_pts_per_px"]
+
+            # Zero line, when zero is in range.
+            if vmin < 0.0 < vmax:
+                zy = rect.bottom - (0.0 - vmin) / vspan * rect.h
+                pygame.draw.line(surf, self.GRID,
+                                 (rect.left + 1, zy), (rect.right - 1, zy))
+
+            for name, color, ts, vs in series:
+                if ts.size < 2:
+                    continue
+                # DISPLAY-ONLY decimation (config max_pts_per_px). The ring
+                # keeps every sample; logging and filters never see this.
+                step = max(1, ts.size // max_pts)
+                if step > 1:
+                    ts = np.concatenate((ts[::step], ts[-1:]))
+                    vs = np.concatenate((vs[::step], vs[-1:]))
+                xs = rect.right - (t_right - ts) * px_per_us
+                ys = rect.bottom - (vs - vmin) / vspan * rect.h
+                np.clip(ys, rect.top + 1, rect.bottom - 1, out=ys)
+                keep = xs >= rect.left + 1
+                pts = np.column_stack((xs[keep], ys[keep]))
+                if pts.shape[0] >= 2:
+                    pygame.draw.lines(surf, color, False, pts.tolist(), 1)
+
+        # Labels: group name, colored channel legend, y-range readout.
+        x = rect.left + 6
+        lbl = font.render(self.group, True, (220, 220, 225))
+        surf.blit(lbl, (x, rect.top + 4))
+        x += lbl.get_width() + 12
+        for name, color, _, _ in series:
+            s = font.render(name, True, color)
+            surf.blit(s, (x, rect.top + 4))
+            x += s.get_width() + 8
+        ymax_s = font.render(f"{vmax:.3g}", True, self.LABEL)
+        surf.blit(ymax_s, (rect.right - ymax_s.get_width() - 4, rect.top + 4))
+        ymin_s = font.render(f"{vmin:.3g}", True, self.LABEL)
+        surf.blit(ymin_s, (rect.right - ymin_s.get_width() - 4,
+                           rect.bottom - ymin_s.get_height() - 4))
+
+
+def draw_graph_strip(surf, panels, t, data, W, H, strip_h, font):
+    """Lay the enabled panels side by side along the bottom strip."""
+    gap = GRAPH_CONFIG["panel_gap"]
+    n = len(panels)
+    pw = (W - gap * (n + 1)) // n
+    top = H - strip_h
+    for i, p in enumerate(panels):
+        rect = pygame.Rect(gap + i * (pw + gap), top + gap,
+                           pw, strip_h - 2 * gap)
+        p.draw(surf, rect, p.series_from_ring(t, data), font)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("port", help="serial port, e.g. COM4")
     ap.add_argument("--baud", type=int, default=115200)
     args = ap.parse_args()
 
-    reader = SerialReader(args.port, args.baud)
+    # Ring buffer of raw samples (the pipeline backbone). Capacity covers
+    # ~1.5x the graph window at the nominal 100 Hz, so the Phase 2 logger has
+    # slack to drain incrementally before anything is overwritten.
+    ring = RingBuffer(max(256, int(GRAPH_CONFIG["window_s"] * 100 * 1.5)))
+    reader = SerialReader(args.port, args.baud, ring)
     reader.start()
 
     pygame.init()
@@ -414,6 +635,21 @@ def main():
         pygame.K_7: "temp",
     }
 
+    # Graph panels (Phase 1), in GRAPH_CONFIG["panels"] order. Toggle keys
+    # follow that order on the home row, skipping F (fullscreen): A S D G H J
+    # K. TAB shows/hides the whole strip. Same toggle model as 1-7.
+    panels = [GraphPanel(spec) for spec in GRAPH_CONFIG["panels"]]
+    graphs_on = GRAPH_CONFIG["graphs_on"]
+    graph_key_order = [pygame.K_a, pygame.K_s, pygame.K_d, pygame.K_g,
+                       pygame.K_h, pygame.K_j, pygame.K_k]
+    graph_keys = {k: i for i, k in enumerate(graph_key_order[:len(panels)])}
+    # Strip render cache: the strip is redrawn only when a NEW sample arrives
+    # (ring.count in the key) or the layout/toggles change, then blitted every
+    # frame. At 144 fps with 100 Hz data this skips ~30% of strip redraws with
+    # zero staleness: any new sample changes the key and forces a fresh draw.
+    strip_cache_key = None
+    strip_surf = None
+
     running = True
     while running:
         for e in pygame.event.get():
@@ -438,6 +674,11 @@ def main():
             elif e.type == pygame.KEYDOWN and e.key in group_keys:
                 g = group_keys[e.key]
                 show[g] = not show[g]
+            elif e.type == pygame.KEYDOWN and e.key == pygame.K_TAB:
+                graphs_on = not graphs_on
+            elif e.type == pygame.KEYDOWN and e.key in graph_keys:
+                p = panels[graph_keys[e.key]]
+                p.on = not p.on
             elif e.type == pygame.KEYDOWN and e.key in (pygame.K_f, pygame.K_F11):
                 # Toggle fullscreen. Remember the windowed size to restore to.
                 fullscreen = not fullscreen
@@ -451,9 +692,14 @@ def main():
                 screen = set_mode((max(480, e.w), max(360, e.h)), False)
 
         # Live surface dimensions: recomputed every frame so resize/fullscreen
-        # take effect immediately and the board stays centered.
+        # take effect immediately and the board stays centered. When the graph
+        # strip is visible, the 3D view and the UI anchored to its bottom edge
+        # compress into the area above it (base_h).
         W, H = screen.get_size()
-        cx, cy = W // 2, H // 2 - 20
+        active_panels = [p for p in panels if p.on] if graphs_on else []
+        strip_h = int(H * GRAPH_CONFIG["strip_frac"]) if active_panels else 0
+        base_h = H - strip_h
+        cx, cy = W // 2, base_h // 2 - 20
 
         st = reader.get()
         quat = st["quat"]
@@ -533,9 +779,9 @@ def main():
         qw, qx, qy, qz = quat
         pitch, roll, yaw = quat_to_euler(q_cal)
 
-        txt(f"Pitch: {pitch:8.3f}", WHITE, 16, H - 150)
-        txt(f"Roll:  {roll:8.3f}", RED, 16, H - 122)
-        txt(f"Yaw:   {yaw:8.3f}", GREEN, 16, H - 94)
+        txt(f"Pitch: {pitch:8.3f}", WHITE, 16, base_h - 150)
+        txt(f"Roll:  {roll:8.3f}", RED, 16, base_h - 122)
+        txt(f"Yaw:   {yaw:8.3f}", GREEN, 16, base_h - 94)
 
         # Quaternion norm sanity: a healthy unit quaternion is |q| ~ 1.0. A
         # drift flags a parse/scale problem or all-zero data (sensor not yet in
@@ -543,16 +789,16 @@ def main():
         qnorm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
         norm_ok = abs(qnorm - 1.0) < 0.05
         ncol = GREY if norm_ok else (220, 180, 60)
-        txt(f"|q|={qnorm:5.3f}", ncol, 16, H - 36, small)
+        txt(f"|q|={qnorm:5.3f}", ncol, 16, base_h - 36, small)
 
         # Calibration levels (sys/gyr/acc/mag): red until 3, green at 3. In NDOF
         # the absolute orientation is only trustworthy once all reach 3.
         cs, cg, ca, cm = calib
         cal_x = 150
-        txt("cal", GREY, cal_x, H - 36, small)
+        txt("cal", GREY, cal_x, base_h - 36, small)
         for i, (lbl, lvl) in enumerate((("S", cs), ("G", cg), ("A", ca), ("M", cm))):
             ccol = GREEN if lvl == 3 else RED
-            txt(f"{lbl}{lvl}", ccol, cal_x + 36 + i * 38, H - 36, small)
+            txt(f"{lbl}{lvl}", ccol, cal_x + 36 + i * 38, base_h - 36, small)
 
         # Calibration coaching: show the action for each subsystem still below 3,
         # so the hint tells you what to do right now and vanishes once you're
@@ -567,9 +813,9 @@ def main():
             cal_hints.append("wave figure-8 (mag)")
         if cal_hints:
             hint = "Calibrate: " + "   ".join(cal_hints)
-            screen.blit(small.render(hint, True, (220, 180, 60)), (cal_x, H - 14))
+            screen.blit(small.render(hint, True, (220, 180, 60)), (cal_x, base_h - 14))
         elif cs == 3:
-            screen.blit(small.render("Fully calibrated", True, GREEN), (cal_x, H - 14))
+            screen.blit(small.render("Fully calibrated", True, GREEN), (cal_x, base_h - 14))
 
         status = "LIVE" if live else ("connected, no data" if connected else f"waiting for {args.port}...")
         scol = (60, 220, 90) if live else (220, 180, 60)
@@ -612,8 +858,23 @@ def main():
             panel_y += 22
 
         screen.blit(small.render(
-            "C: zero  R: reset  1-7: sensors  F: fullscreen  scroll/+-: zoom  Esc/Q: quit",
-            True, GREY), (W - 470, H - 20))
+            "TAB: graphs  ASDGHJK: panels  C: zero  R: reset  1-7: sensors  F: fullscr  +/-: zoom  Esc/Q: quit",
+            True, GREY), (W - 700, base_h - 20))
+
+        # Graph strip (Phase 1): enabled panels side by side along the bottom.
+        # Rendered into a cached surface keyed on (new data, size, toggles);
+        # see strip_cache_key comment above.
+        if active_panels:
+            key = (ring.count, W, strip_h, tuple(p.on for p in panels))
+            if key != strip_cache_key:
+                if strip_surf is None or strip_surf.get_size() != (W, strip_h):
+                    strip_surf = pygame.Surface((W, strip_h))
+                strip_surf.fill(BG)
+                t_arr, data_arr = ring.window(int(GRAPH_CONFIG["window_s"] * 1e6))
+                draw_graph_strip(strip_surf, active_panels, t_arr, data_arr,
+                                 W, strip_h, strip_h, small)
+                strip_cache_key = key
+            screen.blit(strip_surf, (0, H - strip_h))
 
         pygame.display.flip()
         clock.tick()   # uncapped; vsync paces presentation to the monitor
