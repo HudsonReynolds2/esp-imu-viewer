@@ -30,9 +30,11 @@ Run:
 Controls: Esc/Q quit, C zero, R reset, 1-7 numeric sensor panel, F/F11
 fullscreen, scroll/+- zoom, TAB show/hide the graph strip, A/S/D/G/H/J/K
 toggle individual graph panels (home row in GRAPH_CONFIG panel order; F is
-skipped because it is fullscreen). Graph appearance (channels, window length,
-colors, layout, y-scales) is configured in GRAPH_CONFIG at the top of this
-file.
+skipped because it is fullscreen), L start/stop CSV recording. Recordings are
+written as imu_YYYYMMDD_HHMMSS.csv in the current directory: the raw FIELDS
+exactly as streamed (t_us is the authoritative timestamp) plus a host
+wall-clock column. Graph appearance (channels, window length, colors, layout,
+y-scales) is configured in GRAPH_CONFIG at the top of this file.
 
 Notes on conventions: the firmware streams the BNO055 fused quaternion in its
 native W,X,Y,Z register order. quat_to_matrix() builds the rotation matrix from
@@ -122,13 +124,13 @@ GRAPH_CONFIG = {
     "max_pts_per_px": 1,    # DISPLAY-ONLY decimation cap; never thins the data
     "graphs_on": True,      # strip visible at startup
     "panels": [
-        {"group": "quat",    "y": (-1.1, 1.1), "on": False},
+        {"group": "quat",    "y": (-1.1, 1.1), "on": True},
         {"group": "accel",   "y": "auto",      "on": True},
         {"group": "gyro",    "y": "auto",      "on": True},
-        {"group": "mag",     "y": "auto",      "on": False},
-        {"group": "linear",  "y": "auto",      "on": False},
-        {"group": "gravity", "y": "auto",      "on": False},
-        {"group": "temp",    "y": "auto",      "on": False},
+        {"group": "mag",     "y": "auto",      "on": True},
+        {"group": "linear",  "y": "auto",      "on": True},
+        {"group": "gravity", "y": "auto",      "on": True},
+        {"group": "temp",    "y": "auto",      "on": True},
     ],
 }
 
@@ -136,23 +138,32 @@ GRAPH_CONFIG = {
 # ----------------------------------------------------------------------------
 # Ring buffer of raw samples: the backbone of the data pipeline (handoff
 # "Architecture" section). The SerialReader fills it; consumers take windowed
-# copies: graphs read a window, the 3D view reads the latest, and the coming
-# logging (Phase 2) and filters (Phase 3) consume from the same structure.
+# copies: graphs read a window, the 3D view reads the latest, and the CSV
+# logger (Phase 2) and filters (Phase 3) consume from the same structure.
 # Only RAW samples live here; filter outputs are derived consumer-side.
 # ----------------------------------------------------------------------------
+
+# Ring rows are the FIELDS values in order plus one trailing host wall-clock
+# column (unix seconds, captured by the reader at line arrival). t_us stays
+# the authoritative timing clock; host time is for correlating logs with the
+# outside world.
+ROW_LEN = len(FIELDS) + 1
+HOST_T_IDX = len(FIELDS)
+
+
 class RingBuffer:
     """Thread-safe circular store of samples in a preallocated numpy array.
 
-    Rows are the FIELDS values in order (float64; t_us up to ~9e15 us stays
-    exact in a double, i.e. centuries of device uptime). `count` is the total
-    number of samples ever appended (monotonic), so a consumer can tell how
-    much is new since it last looked - the Phase 2 logger will drain by
-    tracking count, without removing anything graphs or filters still need.
+    Rows are FIELDS in order + host wall clock, float64 (t_us up to ~9e15 us
+    stays exact in a double, i.e. centuries of device uptime). `count` is the
+    total number of samples ever appended (monotonic), so a consumer can tell
+    how much is new since it last looked - the CSV logger drains by tracking
+    count, without removing anything graphs or filters still need.
     """
 
     def __init__(self, capacity):
         self.capacity = capacity
-        self._data = np.zeros((capacity, len(FIELDS)), dtype=np.float64)
+        self._data = np.zeros((capacity, ROW_LEN), dtype=np.float64)
         self._lock = threading.Lock()
         self._next = 0          # next write slot
         self.count = 0          # total samples ever appended
@@ -170,7 +181,7 @@ class RingBuffer:
         with self._lock:
             n = min(self.count, self.capacity)
             if n == 0:
-                return np.empty(0), np.empty((0, len(FIELDS)))
+                return np.empty(0), np.empty((0, ROW_LEN))
             if self.count <= self.capacity:
                 out = self._data[:n].copy()
             else:
@@ -181,6 +192,92 @@ class RingBuffer:
             out = out[t >= t[-1] - window_us]
             t = out[:, T_US_IDX]
         return t, out
+
+    def rows_since(self, last_count):
+        """Incremental drain for the logger: rows appended after the first
+        `last_count` samples, oldest->newest. Returns (new_count, rows,
+        n_lost); n_lost > 0 means the consumer fell more than `capacity`
+        behind and that many rows were overwritten before being read."""
+        with self._lock:
+            n_new = self.count - last_count
+            if n_new <= 0:
+                return self.count, np.empty((0, ROW_LEN)), 0
+            n_lost = max(0, n_new - self.capacity)
+            n_take = n_new - n_lost
+            start = (self._next - n_take) % self.capacity
+            if start + n_take <= self.capacity:
+                rows = self._data[start:start + n_take].copy()
+            else:
+                rows = np.vstack((self._data[start:],
+                                  self._data[:start + n_take - self.capacity]))
+            return self.count, rows, n_lost
+
+
+# ----------------------------------------------------------------------------
+# CSV logging (Phase 2). One file per recording session, named
+# imu_YYYYMMDD_HHMMSS.csv in the current directory. Columns are the raw
+# FIELDS exactly as streamed (t_us is the authoritative timestamp) plus
+# host_unix_s. The logger drains the ring incrementally via rows_since(), so
+# it records every sample regardless of frame rate, and the display
+# decimation never touches it.
+# ----------------------------------------------------------------------------
+_INT_FIELDS = {"seq", "t_us", "temp", "cs", "cg", "ca", "cm"}
+ROW_FORMATS = (["%d" if f in _INT_FIELDS else
+                ("%.4f" if f in SENSOR_GROUPS["quat"] else "%.3f")
+                for f in FIELDS] + ["%.6f"])     # trailing host_unix_s
+
+
+class CsvLogger:
+    def __init__(self, ring):
+        self.ring = ring
+        self.file = None
+        self.path = None
+        self.rows = 0
+        self.lost = 0
+        self._last_count = 0
+
+    @property
+    def active(self):
+        return self.file is not None
+
+    def start(self):
+        self.path = time.strftime("imu_%Y%m%d_%H%M%S.csv")
+        try:
+            self.file = open(self.path, "w", newline="")
+        except OSError as e:
+            print(f"could not open log file {self.path}: {e}")
+            self.file = None
+            return
+        self.file.write(",".join(FIELDS + ["host_unix_s"]) + "\n")
+        self.rows = 0
+        self.lost = 0
+        self._last_count = self.ring.count   # record from NOW, not backlog
+
+    def stop(self):
+        if self.file is not None:
+            self.drain()
+            self.file.close()
+            self.file = None
+
+    def toggle(self):
+        if self.active:
+            self.stop()
+        else:
+            self.start()
+
+    def drain(self):
+        """Call once per frame while recording: writes all samples that
+        arrived since the last drain."""
+        if self.file is None:
+            return
+        self._last_count, rows, lost = self.ring.rows_since(self._last_count)
+        self.lost += lost
+        if rows.shape[0]:
+            self.file.write("\n".join(
+                ",".join(fmt % v for fmt, v in zip(ROW_FORMATS, r))
+                for r in rows) + "\n")
+            self.file.flush()
+            self.rows += rows.shape[0]
 
 # ----------------------------------------------------------------------------
 # Serial reader thread: keeps the latest (pitch, roll, yaw) in a shared slot.
@@ -296,9 +393,10 @@ class SerialReader(threading.Thread):
         quat = (vals["qw"], vals["qx"], vals["qy"], vals["qz"])
         calib = (int(vals["cs"]), int(vals["cg"]), int(vals["ca"]), int(vals["cm"]))
 
-        # Raw sample into the ring (its own lock). Row order == FIELDS order.
+        # Raw sample into the ring (its own lock). Row order == FIELDS order,
+        # plus host wall clock captured at arrival (for the CSV log).
         if self.ring is not None:
-            self.ring.append([vals[f] for f in FIELDS])
+            self.ring.append([vals[f] for f in FIELDS] + [time.time()])
 
         with self.lock:
             self.version_ok = True
@@ -444,6 +542,18 @@ def project(v, scale, cx, cy):
 # outputs plot through this exact same path by handing the panel their own
 # (t, value) streams; series_from_ring() is merely the raw-channel source.
 # ----------------------------------------------------------------------------
+def _nice_step(span, target=4):
+    """Gridline spacing: smallest 1/2/5 x 10^k step giving <= target lines."""
+    if span <= 0:
+        return 1.0
+    raw = span / target
+    mag = 10.0 ** math.floor(math.log10(raw))
+    for m in (1.0, 2.0, 5.0, 10.0):
+        if m * mag >= raw:
+            return m * mag
+    return 10.0 * mag
+
+
 class GraphPanel:
     BG = (14, 14, 20)
     BORDER = (60, 60, 72)
@@ -488,19 +598,49 @@ class GraphPanel:
             vmin, vmax = self.yspec
         vspan = vmax - vmin
 
+        # Live current-value tags are rendered first because their width sets
+        # the right gutter the plot leaves for them (a live y-axis: each tag
+        # sits at its trace's current height, in the trace color).
+        tags = []
+        for name, color, ts, vs in series:
+            if vs.size:
+                v = float(vs[-1])
+                txt_v = f"{v:.3f}" if abs(v) < 1000 else f"{v:.4g}"
+                tags.append((v, font.render(txt_v, True, color)))
+        gutter = max((lab.get_width() for _, lab in tags), default=0)
+        gutter = max(34, gutter + 8)
+        plot = pygame.Rect(rect.left, rect.top, rect.w - gutter, rect.h)
+
+        def to_y(v):
+            return plot.bottom - (v - vmin) / vspan * plot.h
+
+        # Horizontal gridlines at "nice" intervals (1/2/5 x 10^k), labeled at
+        # the left edge; the zero line draws brighter.
+        step = _nice_step(vspan)
+        k = math.ceil(vmin / step)
+        while k * step < vmax:
+            gv = k * step
+            gy = to_y(gv)
+            col = (56, 56, 70) if k == 0 else self.GRID
+            pygame.draw.line(surf, col, (plot.left + 1, gy),
+                             (plot.right - 1, gy))
+            # Skip labels that would collide with the legend row or border.
+            if rect.top + 22 < gy < rect.bottom - 9:
+                lab = font.render(f"{gv:.3g}", True, self.LABEL)
+                surf.blit(lab, (plot.left + 3, gy - lab.get_height() // 2))
+            k += 1
+
+        # Axis separator between plot and the value gutter.
+        pygame.draw.line(surf, self.BORDER, (plot.right, rect.top + 1),
+                         (plot.right, rect.bottom - 1))
+
         # Newest sample defines the right edge; traces scroll leftward. Always
         # the freshest data, no interpolation (render model: see handoff).
         t_right = max((ts[-1] for _, _, ts, _ in series if ts.size),
                       default=None)
         if t_right is not None:
-            px_per_us = rect.w / window_us
-            max_pts = rect.w * GRAPH_CONFIG["max_pts_per_px"]
-
-            # Zero line, when zero is in range.
-            if vmin < 0.0 < vmax:
-                zy = rect.bottom - (0.0 - vmin) / vspan * rect.h
-                pygame.draw.line(surf, self.GRID,
-                                 (rect.left + 1, zy), (rect.right - 1, zy))
+            px_per_us = plot.w / window_us
+            max_pts = plot.w * GRAPH_CONFIG["max_pts_per_px"]
 
             for name, color, ts, vs in series:
                 if ts.size < 2:
@@ -511,15 +651,26 @@ class GraphPanel:
                 if step > 1:
                     ts = np.concatenate((ts[::step], ts[-1:]))
                     vs = np.concatenate((vs[::step], vs[-1:]))
-                xs = rect.right - (t_right - ts) * px_per_us
-                ys = rect.bottom - (vs - vmin) / vspan * rect.h
-                np.clip(ys, rect.top + 1, rect.bottom - 1, out=ys)
-                keep = xs >= rect.left + 1
+                xs = plot.right - (t_right - ts) * px_per_us
+                ys = plot.bottom - (vs - vmin) / vspan * plot.h
+                np.clip(ys, plot.top + 1, plot.bottom - 1, out=ys)
+                keep = xs >= plot.left + 1
                 pts = np.column_stack((xs[keep], ys[keep]))
                 if pts.shape[0] >= 2:
                     pygame.draw.lines(surf, color, False, pts.tolist(), 1)
 
-        # Labels: group name, colored channel legend, y-range readout.
+        # Value tags in the gutter, nudged apart when traces overlap.
+        tag_h = font.get_height()
+        prev_y = None
+        for v, lab in sorted(tags, key=lambda t: to_y(t[0])):
+            y = min(max(to_y(v) - tag_h / 2, rect.top + 2),
+                    rect.bottom - tag_h - 2)
+            if prev_y is not None and y < prev_y + tag_h:
+                y = prev_y + tag_h
+            prev_y = y
+            surf.blit(lab, (plot.right + 4, y))
+
+        # Legend: group name + colored channel names.
         x = rect.left + 6
         lbl = font.render(self.group, True, (220, 220, 225))
         surf.blit(lbl, (x, rect.top + 4))
@@ -528,11 +679,6 @@ class GraphPanel:
             s = font.render(name, True, color)
             surf.blit(s, (x, rect.top + 4))
             x += s.get_width() + 8
-        ymax_s = font.render(f"{vmax:.3g}", True, self.LABEL)
-        surf.blit(ymax_s, (rect.right - ymax_s.get_width() - 4, rect.top + 4))
-        ymin_s = font.render(f"{vmin:.3g}", True, self.LABEL)
-        surf.blit(ymin_s, (rect.right - ymin_s.get_width() - 4,
-                           rect.bottom - ymin_s.get_height() - 4))
 
 
 def draw_graph_strip(surf, panels, t, data, W, H, strip_h, font):
@@ -559,6 +705,7 @@ def main():
     ring = RingBuffer(max(256, int(GRAPH_CONFIG["window_s"] * 100 * 1.5)))
     reader = SerialReader(args.port, args.baud, ring)
     reader.start()
+    logger = CsvLogger(ring)   # Phase 2: L starts/stops a CSV recording
 
     pygame.init()
     W, H = 900, 640
@@ -676,6 +823,8 @@ def main():
                 show[g] = not show[g]
             elif e.type == pygame.KEYDOWN and e.key == pygame.K_TAB:
                 graphs_on = not graphs_on
+            elif e.type == pygame.KEYDOWN and e.key == pygame.K_l:
+                logger.toggle()
             elif e.type == pygame.KEYDOWN and e.key in graph_keys:
                 p = panels[graph_keys[e.key]]
                 p.on = not p.on
@@ -709,6 +858,11 @@ def main():
         last_t = st["last_t"]
         line_count = st["line_count"]
         live = connected and (time.time() - last_t) < 1.0
+
+        # Phase 2: while recording, write everything that arrived this frame.
+        # Drains via ring.rows_since(), so every sample lands in the CSV
+        # regardless of frame rate; display decimation never touches this.
+        logger.drain()
 
         # Update render-FPS counter on a rolling window. (Data rate now comes
         # from the device timestamp in the reader, not from arrival timing.)
@@ -857,9 +1011,22 @@ def main():
                     txt(f"{vals}  {units.get(g, '')}", WHITE, 90, panel_y, small)
             panel_y += 22
 
-        screen.blit(small.render(
-            "TAB: graphs  ASDGHJK: panels  C: zero  R: reset  1-7: sensors  F: fullscr  +/-: zoom  Esc/Q: quit",
-            True, GREY), (W - 700, base_h - 20))
+        hs = small.render(
+            "TAB: graphs  ASDGHJK: panels  L: record  C: zero  R: reset  "
+            "1-7: sensors  F: fullscr  +/-: zoom  Esc/Q: quit",
+            True, GREY)
+        screen.blit(hs, (W - hs.get_width() - 16, base_h - 20))
+
+        # Recording indicator: red dot + filename + rows, top center.
+        if logger.active:
+            msg = f"REC {logger.path}  {logger.rows} rows"
+            if logger.lost:
+                msg += f"  LOST {logger.lost}"
+            rs = small.render(msg, True, (235, 90, 90))
+            rx = W // 2 - rs.get_width() // 2
+            pygame.draw.circle(screen, (235, 70, 70),
+                               (rx - 12, 12 + rs.get_height() // 2), 5)
+            screen.blit(rs, (rx, 12))
 
         # Graph strip (Phase 1): enabled panels side by side along the bottom.
         # Rendered into a cached surface keyed on (new data, size, toggles);
@@ -879,6 +1046,7 @@ def main():
         pygame.display.flip()
         clock.tick()   # uncapped; vsync paces presentation to the monitor
 
+    logger.stop()   # flushes and closes the CSV if recording
     reader.stop()
     pygame.quit()
 
