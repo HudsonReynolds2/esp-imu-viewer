@@ -352,6 +352,7 @@ void app_main(void)
     while (1) {
         int64_t t_us = esp_timer_get_time();      /* device clock, pre-read   */
         esp_err_t err = bno_read_all(&s);
+        int64_t t_after_read = esp_timer_get_time();
         if (err == ESP_OK) {
             int n = snprintf(line, sizeof(line),
                 "v2,%lu,%lld,"
@@ -377,6 +378,20 @@ void app_main(void)
             }
             seq++;   /* wrap-safe: readers compute (cur - prev) in uint32 */
         }
+        int64_t t_after_print = esp_timer_get_time();
+
+        /* TEMP DIAGNOSTIC: every 100th sample, emit timing in microseconds for
+         * the I2C read and for the snprintf+fwrite+fflush, plus the total since
+         * loop top. The visualizer ignores this non-data line. Read this in the
+         * serial monitor to see where the ~14 ms/cycle is going. */
+        if ((seq % 100) == 0) {
+            printf("# t read_us=%lld print_us=%lld busy_us=%lld\r\n",
+                   (long long)(t_after_read - t_us),
+                   (long long)(t_after_print - t_after_read),
+                   (long long)(t_after_print - t_us));
+            fflush(stdout);
+        }
+
         /* Sleep until the next 10 ms boundary regardless of read/print time. */
         xTaskDelayUntil(&wake, period);
     }
