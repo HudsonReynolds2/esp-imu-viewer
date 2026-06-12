@@ -30,6 +30,7 @@
 #include "esp_check.h"
 #include "esp_timer.h"
 #include "driver/i2c_master.h"
+#include "driver/usb_serial_jtag.h"
 
 /* ---- User configuration ------------------------------------------------- */
 /* XIAO ESP32C3 silkscreen D4 = GPIO6 (SDA), D5 = GPIO7 (SCL). Change if you
@@ -265,6 +266,20 @@ void app_main(void)
      * valid data line, so it is robust to the banner regardless. */
     esp_log_level_set("*", ESP_LOG_NONE);
 
+    /* Make stdout writes non-blocking. By default the USB Serial/JTAG VFS does
+     * BLOCKING writes: it busy-waits until the host drains the endpoint, costing
+     * ~9-12 ms/cycle (measured) and capping the loop near 71 Hz. We install the
+     * interrupt-driven driver (which gives us a background TX ring buffer) and
+     * write the data lines DIRECTLY with usb_serial_jtag_write_bytes(..., 0),
+     * which queues bytes and returns immediately without touching the blocking
+     * stdio path. (Routing stdout through the VFS driver proved unreliable on
+     * this build, so we bypass stdio for the hot path entirely.) */
+    usb_serial_jtag_driver_config_t usj_cfg = {
+        .tx_buffer_size = 4096,
+        .rx_buffer_size = 256,
+    };
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usj_cfg));
+
     /* ---- I2C master bus + device, created once ------------------------- */
     i2c_master_bus_config_t bus_cfg = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -345,9 +360,11 @@ void app_main(void)
      * period_ticks is not 10, the CONFIG_FREERTOS_HZ=1000 change did not make it
      * into this binary, which is what caps the loop near 71 Hz. The visualizer
      * ignores any line it cannot parse, so this diag line is harmless there. */
-    printf("# diag tick_hz=%d period_ticks=%u\r\n",
-           (int)configTICK_RATE_HZ, (unsigned)period);
-    fflush(stdout);
+    int dn = snprintf(line, sizeof(line), "# diag tick_hz=%d period_ticks=%u\r\n",
+                      (int)configTICK_RATE_HZ, (unsigned)period);
+    if (dn > 0) {
+        usb_serial_jtag_write_bytes(line, (size_t)dn, pdMS_TO_TICKS(20));
+    }
 
     while (1) {
         int64_t t_us = esp_timer_get_time();      /* device clock, pre-read   */
@@ -373,23 +390,29 @@ void app_main(void)
                 (int)s.temp,
                 s.cal_sys, s.cal_gyr, s.cal_acc, s.cal_mag);
             if (n > 0) {
-                fwrite(line, 1, (size_t)n, stdout);
-                fflush(stdout);
+                /* Non-blocking: queue into the driver TX buffer and return at
+                 * once (ticks_to_wait = 0). Replaces the blocking fwrite+fflush
+                 * that was costing ~9-12 ms/cycle. */
+                usb_serial_jtag_write_bytes(line, (size_t)n, 0);
             }
             seq++;   /* wrap-safe: readers compute (cur - prev) in uint32 */
         }
         int64_t t_after_print = esp_timer_get_time();
 
         /* TEMP DIAGNOSTIC: every 100th sample, emit timing in microseconds for
-         * the I2C read and for the snprintf+fwrite+fflush, plus the total since
-         * loop top. The visualizer ignores this non-data line. Read this in the
-         * serial monitor to see where the ~14 ms/cycle is going. */
+         * the I2C read and for the snprintf+write, plus the total since loop
+         * top. Routed through the driver (non-blocking) so the diagnostic itself
+         * does not stall the loop. The visualizer ignores this non-data line. */
         if ((seq % 100) == 0) {
-            printf("# t read_us=%lld print_us=%lld busy_us=%lld\r\n",
+            char dbg[80];
+            int dl = snprintf(dbg, sizeof(dbg),
+                   "# t read_us=%lld print_us=%lld busy_us=%lld\r\n",
                    (long long)(t_after_read - t_us),
                    (long long)(t_after_print - t_after_read),
                    (long long)(t_after_print - t_us));
-            fflush(stdout);
+            if (dl > 0) {
+                usb_serial_jtag_write_bytes(dbg, (size_t)dl, 0);
+            }
         }
 
         /* Sleep until the next 10 ms boundary regardless of read/print time. */
