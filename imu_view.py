@@ -37,7 +37,6 @@ marked in quat_to_matrix()).
 """
 import argparse
 import math
-import re
 import sys
 import threading
 import time
@@ -50,11 +49,36 @@ except ImportError:
     print("pygame is not installed. In your venv run:  python -m pip install pygame")
     sys.exit(1)
 
-# qw,qx,qy,qz (signed floats) then four 0-3 cal digits. Anchored so the boot
-# banner and any stray line can never match.
-GOOD = re.compile(
-    r'^(-?\d+\.\d+),(-?\d+\.\d+),(-?\d+\.\d+),(-?\d+\.\d+),([0-3]),([0-3]),([0-3]),([0-3])$'
-)
+# Wire format (must match the firmware). Version-prefixed positional CSV:
+#   v2,seq,t_us,qw,qx,qy,qz,ax,ay,az,gx,gy,gz,mx,my,mz,lx,ly,lz,grx,gry,grz,temp,cs,cg,ca,cm
+# We split on commas rather than one giant regex: it is faster for 27 fields and
+# the version tag + field count give us a cheap, unambiguous validity check, so
+# the ESP-ROM boot banner and any stray line are still rejected.
+WIRE_VERSION = "v2"
+# Field names in order AFTER the version tag. Indices into the split line[1:].
+FIELDS = [
+    "seq", "t_us",
+    "qw", "qx", "qy", "qz",
+    "ax", "ay", "az",
+    "gx", "gy", "gz",
+    "mx", "my", "mz",
+    "lx", "ly", "lz",
+    "grx", "gry", "grz",
+    "temp", "cs", "cg", "ca", "cm",
+]
+N_FIELDS = len(FIELDS) + 1   # +1 for the version tag
+
+# Logical sensor groups, for the visualizer's show/hide toggles and for logging
+# headers. Each maps to the field names it owns.
+SENSOR_GROUPS = {
+    "quat":    ["qw", "qx", "qy", "qz"],
+    "accel":   ["ax", "ay", "az"],
+    "gyro":    ["gx", "gy", "gz"],
+    "mag":     ["mx", "my", "mz"],
+    "linear":  ["lx", "ly", "lz"],
+    "gravity": ["grx", "gry", "grz"],
+    "temp":    ["temp"],
+}
 
 # ----------------------------------------------------------------------------
 # Serial reader thread: keeps the latest (pitch, roll, yaw) in a shared slot.
@@ -66,11 +90,24 @@ class SerialReader(threading.Thread):
         self.port = port
         self.baud = baud
         self.lock = threading.Lock()
-        self.quat = (1.0, 0.0, 0.0, 0.0)   # w, x, y, z (identity)
+        # Latest full sample as a dict keyed by FIELDS names (floats), plus the
+        # quaternion broken out for convenience. Identity until first line.
+        self.quat = (1.0, 0.0, 0.0, 0.0)   # w, x, y, z
         self.calib = (0, 0, 0, 0)          # sys, gyr, acc, mag
+        self.sample = {f: 0.0 for f in FIELDS}
         self.connected = False
         self.last_line_time = 0.0
         self.line_count = 0             # total valid lines, for data-rate calc
+        # Stream-quality stats computed from seq + device timestamp.
+        self.dropped = 0                # missed samples (seq gaps)
+        self.dups = 0                   # consecutive identical quaternions
+        self.dev_hz = 0.0               # rate from device timestamps
+        self.jitter_ms = 0.0            # stddev of inter-sample dt (device clock)
+        self.version_ok = True          # False if firmware tag != WIRE_VERSION
+        self._prev_seq = None
+        self._prev_t_us = None
+        self._prev_quat = None
+        self._dt_window = []            # recent inter-sample dt, for jitter
         self._stop = False
 
     def _open(self):
@@ -125,27 +162,93 @@ class SerialReader(threading.Thread):
                     text = raw.decode("ascii")
                 except UnicodeDecodeError:
                     continue
-                m = GOOD.match(text)
-                if m:
-                    qw, qx, qy, qz = (float(m.group(1)), float(m.group(2)),
-                                      float(m.group(3)), float(m.group(4)))
-                    cs, cg, ca, cm = (int(m.group(5)), int(m.group(6)),
-                                      int(m.group(7)), int(m.group(8)))
-                    with self.lock:
-                        self.quat = (qw, qx, qy, qz)
-                        self.calib = (cs, cg, ca, cm)
-                        self.last_line_time = time.time()
-                        self.line_count += 1
+                self._handle_line(text)
         if ser:
             try:
                 ser.close()
             except Exception:
                 pass
 
+    def _handle_line(self, text):
+        # Reject anything that is not a well-formed v2 line. The boot banner and
+        # partial lines fail the checks below and are ignored.
+        parts = text.split(",")
+        if not parts:
+            return
+        tag = parts[0]
+        # Version check first, so a recognizable-but-wrong version still warns
+        # even if its field count differs from ours.
+        if tag != WIRE_VERSION:
+            if tag.startswith("v") and len(tag) <= 4 and tag[1:].isdigit():
+                with self.lock:
+                    self.version_ok = False
+            return
+        if len(parts) != N_FIELDS:
+            return
+        try:
+            vals = {name: float(parts[i + 1]) for i, name in enumerate(FIELDS)}
+            seq = int(vals["seq"])
+            t_us = int(vals["t_us"])
+        except (ValueError, IndexError):
+            return
+
+        quat = (vals["qw"], vals["qx"], vals["qy"], vals["qz"])
+        calib = (int(vals["cs"]), int(vals["cg"]), int(vals["ca"]), int(vals["cm"]))
+
+        with self.lock:
+            self.version_ok = True
+            self.sample = vals
+            self.quat = quat
+            self.calib = calib
+            self.last_line_time = time.time()
+            self.line_count += 1
+
+            # Dropped-frame detection via wrap-safe seq delta (uint32).
+            if self._prev_seq is not None:
+                delta = (seq - self._prev_seq) & 0xFFFFFFFF
+                if delta > 1:
+                    self.dropped += delta - 1
+            self._prev_seq = seq
+
+            # Device-clock rate + jitter from the microsecond timestamp.
+            if self._prev_t_us is not None:
+                dt_us = t_us - self._prev_t_us
+                if 0 < dt_us < 1_000_000:    # ignore wraps / garbage
+                    self._dt_window.append(dt_us)
+                    if len(self._dt_window) > 200:
+                        self._dt_window.pop(0)
+                    mean = sum(self._dt_window) / len(self._dt_window)
+                    if mean > 0:
+                        self.dev_hz = 1_000_000.0 / mean
+                    if len(self._dt_window) > 1:
+                        var = sum((d - mean) ** 2 for d in self._dt_window) / len(self._dt_window)
+                        self.jitter_ms = (var ** 0.5) / 1000.0
+            self._prev_t_us = t_us
+
+            # Duplicate fusion-sample detection: an identical quaternion to the
+            # previous line means the BNO055 had not refreshed (we polled faster
+            # than its 100 Hz fusion update). A stationary sensor will also repeat
+            # values, so this is a coarse "are we oversampling" hint, not an error;
+            # it is only meaningful while the board is actually moving.
+            if self._prev_quat is not None and quat == self._prev_quat:
+                self.dups += 1
+            self._prev_quat = quat
+
     def get(self):
         with self.lock:
-            return (self.quat, self.calib, self.connected,
-                    self.last_line_time, self.line_count)
+            return {
+                "quat": self.quat,
+                "calib": self.calib,
+                "sample": dict(self.sample),
+                "connected": self.connected,
+                "last_t": self.last_line_time,
+                "line_count": self.line_count,
+                "dropped": self.dropped,
+                "dups": self.dups,
+                "dev_hz": self.dev_hz,
+                "jitter_ms": self.jitter_ms,
+                "version_ok": self.version_ok,
+            }
 
     def stop(self):
         self._stop = True
@@ -266,10 +369,8 @@ def main():
 
     # Rate tracking: sample FPS and data Hz over a rolling ~0.5s window.
     fps = 0.0
-    data_hz = 0.0
     frames_since = 0
     rate_t0 = time.time()
-    lines_at_t0 = 0
 
     # Board geometry: a flat slab. Top face green, bottom face red.
     hw, hl, ht = 90, 60, 10  # half width(x), half length(y), half thickness(z)
@@ -295,6 +396,18 @@ def main():
     calib = (0, 0, 0, 0)              # latest cal levels (pre-init)
     q_cal = (1.0, 0.0, 0.0, 0.0)
 
+    # Per-sensor display toggles (visualizer-side selection). The firmware still
+    # streams everything; this only controls what the readout shows. Number keys
+    # 1-7 flip each group. Later this same selection can drive a host->device
+    # command that changes what the firmware emits.
+    group_order = ["quat", "accel", "gyro", "mag", "linear", "gravity", "temp"]
+    show = {g: True for g in group_order}
+    group_keys = {
+        pygame.K_1: "quat", pygame.K_2: "accel", pygame.K_3: "gyro",
+        pygame.K_4: "mag", pygame.K_5: "linear", pygame.K_6: "gravity",
+        pygame.K_7: "temp",
+    }
+
     running = True
     while running:
         for e in pygame.event.get():
@@ -316,19 +429,27 @@ def main():
             elif e.type == pygame.KEYDOWN and e.key == pygame.K_r:
                 # Reset calibration back to raw orientation.
                 q_offset = (1.0, 0.0, 0.0, 0.0)
+            elif e.type == pygame.KEYDOWN and e.key in group_keys:
+                g = group_keys[e.key]
+                show[g] = not show[g]
 
-        (quat, calib, connected, last_t, line_count) = reader.get()
+        st = reader.get()
+        quat = st["quat"]
+        calib = st["calib"]
+        sample = st["sample"]
+        connected = st["connected"]
+        last_t = st["last_t"]
+        line_count = st["line_count"]
         live = connected and (time.time() - last_t) < 1.0
 
-        # Update FPS and data-rate counters on a rolling window.
+        # Update render-FPS counter on a rolling window. (Data rate now comes
+        # from the device timestamp in the reader, not from arrival timing.)
         frames_since += 1
         now = time.time()
         dt = now - rate_t0
         if dt >= 0.5:
             fps = frames_since / dt
-            data_hz = (line_count - lines_at_t0) / dt
             frames_since = 0
-            lines_at_t0 = line_count
             rate_t0 = now
 
         screen.fill(BG)
@@ -393,7 +514,6 @@ def main():
         txt(f"Pitch: {pitch:8.3f}", WHITE, 16, H - 150)
         txt(f"Roll:  {roll:8.3f}", RED, 16, H - 122)
         txt(f"Yaw:   {yaw:8.3f}", GREEN, 16, H - 94)
-        txt(f"q: {qw:7.4f} {qx:7.4f} {qy:7.4f} {qz:7.4f}", WHITE, 16, H - 60, small)
 
         # Quaternion norm sanity: a healthy unit quaternion is |q| ~ 1.0. A
         # drift flags a parse/scale problem or all-zero data (sensor not yet in
@@ -412,12 +532,67 @@ def main():
             ccol = GREEN if lvl == 3 else RED
             txt(f"{lbl}{lvl}", ccol, cal_x + 36 + i * 38, H - 36, small)
 
+        # Calibration coaching: show the action for each subsystem still below 3,
+        # so the hint tells you what to do right now and vanishes once you're
+        # fully calibrated. Gyro: hold still. Accel: tilt through a few poses.
+        # Mag: wave a figure-8. (Sys is the fused result of the other three.)
+        cal_hints = []
+        if cg < 3:
+            cal_hints.append("hold still (gyro)")
+        if ca < 3:
+            cal_hints.append("tilt through poses (accel)")
+        if cm < 3:
+            cal_hints.append("wave figure-8 (mag)")
+        if cal_hints:
+            hint = "Calibrate: " + "   ".join(cal_hints)
+            screen.blit(small.render(hint, True, (220, 180, 60)), (cal_x, H - 14))
+        elif cs == 3:
+            screen.blit(small.render("Fully calibrated", True, GREEN), (cal_x, H - 14))
+
         status = "LIVE" if live else ("connected, no data" if connected else f"waiting for {args.port}...")
         scol = (60, 220, 90) if live else (220, 180, 60)
         screen.blit(small.render(status, True, scol), (16, 12))
-        rate_str = f"{fps:4.0f} FPS   {data_hz:4.0f} Hz data"
-        screen.blit(small.render(rate_str, True, GREY), (W - 230, 12))
-        screen.blit(small.render("C: zero/calibrate   R: reset   scroll/+-: zoom   Esc/Q: quit", True, GREY), (W - 470, 32))
+
+        # Stream-quality stats (top-right). dev_hz/jitter come from the device
+        # microsecond timestamp (authoritative); dropped from seq gaps; dups are
+        # repeated quaternions (polling faster than the 100 Hz fusion update).
+        rate_str = f"{fps:4.0f} FPS render   {st['dev_hz']:5.1f} Hz dev"
+        screen.blit(small.render(rate_str, True, GREY), (W - 260, 12))
+        q_str = f"jit {st['jitter_ms']:4.2f}ms  drop {st['dropped']}  dup {st['dups']}"
+        screen.blit(small.render(q_str, True, GREY), (W - 260, 32))
+        if not st["version_ok"]:
+            warn = small.render("firmware/visualizer version mismatch", True, (230, 80, 80))
+            screen.blit(warn, (W - 320, 52))
+
+        # Per-sensor numeric panel (top-left, under status). Each group is shown
+        # only if toggled on; number keys 1-7 flip them. Greyed label when off.
+        panel_y = 38
+        units = {"accel": "m/s2", "gyro": "dps", "mag": "uT",
+                 "linear": "m/s2", "gravity": "m/s2", "temp": "C"}
+        for ki, g in enumerate(group_order):
+            keyn = ki + 1
+            on = show[g]
+            lblcol = WHITE if on else (90, 90, 100)
+            if g == "quat":
+                txt(f"{keyn} quat", lblcol, 16, panel_y, small)
+                if on:
+                    txt(f"{qw:7.4f} {qx:7.4f} {qy:7.4f} {qz:7.4f}",
+                        WHITE, 90, panel_y, small)
+            elif g == "temp":
+                txt(f"{keyn} temp", lblcol, 16, panel_y, small)
+                if on:
+                    txt(f"{sample.get('temp', 0):.0f} C", WHITE, 90, panel_y, small)
+            else:
+                txt(f"{keyn} {g}", lblcol, 16, panel_y, small)
+                if on:
+                    names = SENSOR_GROUPS[g]
+                    vals = " ".join(f"{sample.get(n, 0):8.3f}" for n in names)
+                    txt(f"{vals}  {units.get(g, '')}", WHITE, 90, panel_y, small)
+            panel_y += 22
+
+        screen.blit(small.render(
+            "C: zero  R: reset  1-7: toggle sensors  scroll/+-: zoom  Esc/Q: quit",
+            True, GREY), (W - 470, H - 20))
 
         pygame.display.flip()
         clock.tick(120)
